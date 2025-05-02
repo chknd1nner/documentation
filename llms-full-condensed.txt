@@ -1,0 +1,882 @@
+# Model Context Protocol (MCP) Knowledge Base for LLM Coding Assistant
+
+## 1. MCP Fundamentals
+
+### 1.1. Overview
+
+*   **Purpose:** An open protocol standardizing how applications (clients/hosts) provide context (data, tools, prompts) to Large Language Models (LLMs) via intermediary servers.
+*   **Architecture:** Client-Server model.
+    *   **Host:** The main application using the LLM (e.g., Claude Desktop, IDE). Hosts MCP Clients.
+    *   **Client:** Resides within the Host. Maintains a 1:1 connection with an MCP Server. Manages protocol interactions.
+    *   **Server:** A separate process (often lightweight) exposing specific capabilities (Resources, Tools, Prompts) over MCP. Can interact with local data or remote APIs.
+    *   **Interaction:** Host -> Client <-(MCP Protocol)-> Server <-> Data Source/API.
+
+    ```mermaid
+    flowchart LR
+        subgraph "Host Application"
+            Client[MCP Client]
+        end
+        subgraph "Server Process"
+            Server[MCP Server]
+        end
+        Client <-->|Transport Layer| Server
+        Server <--> DataSource[(Data Source / API)]
+    ```
+
+### 1.2. Core Architecture
+
+*   **Connection Lifecycle:**
+    1.  Client sends `initialize` request (protocol version, client info, capabilities).
+    2.  Server responds with `initialize` result (protocol version, server info, capabilities).
+    3.  Client sends `initialized` notification.
+    4.  Connection ready for message exchange.
+    5.  Termination via `close()` or transport disconnection.
+*   **Message Format:** [JSON-RPC 2.0](https://www.jsonrpc.org/)
+    *   **Request:** `{ "jsonrpc": "2.0", "id": <req_id>, "method": "<method_name>", "params": <object|array|null> }` (Expects Response)
+    *   **Response (Success):** `{ "jsonrpc": "2.0", "id": <req_id>, "result": <value> }`
+    *   **Response (Error):** `{ "jsonrpc": "2.0", "id": <req_id>, "error": { "code": <error_code>, "message": "<msg>", "data": <optional_info> } }`
+    *   **Notification:** `{ "jsonrpc": "2.0", "method": "<method_name>", "params": <object|array|null> }` (No Response Expected)
+*   **Standard Error Codes (JSON-RPC):**
+    *   `-32700`: Parse error
+    *   `-32600`: Invalid Request
+    *   `-32601`: Method not found
+    *   `-32602`: Invalid params
+    *   `-32603`: Internal error
+    *   Implementation-defined errors >= -32000.
+
+### 1.3. Transports
+
+*   **Purpose:** Handles the low-level communication mechanism (sending/receiving JSON-RPC messages).
+*   **Standard Types:**
+    *   **Stdio:** Uses standard input/output streams. Ideal for local processes running on the same machine. Simple to manage.
+    *   **HTTP with SSE (Server-Sent Events):** Uses HTTP POST for client-to-server messages and SSE for server-to-client messages (streaming). Suitable for remote connections or web-based scenarios.
+*   **Custom Transports:** Possible to implement for other communication channels.
+
+## 2. Core MCP Concepts
+
+### 2.1. Resources
+
+*   **Purpose:** Expose **application-controlled** data/content from servers to clients (e.g., file contents, database rows, API data). Clients decide how/when to use them.
+*   **URI Format:** `[protocol]://[host]/[path]` (e.g., `file:///path/to/doc.txt`, `postgres://db/table/schema`). Server defines its schemes.
+*   **Types:**
+    *   **Text:** UTF-8 encoded string.
+    *   **Binary:** Base64 encoded string.
+*   **Structure (`resources/list` response):**
+    ```typescript
+    {
+      uri: string;           // Unique identifier
+      name: string;          // Human-readable name
+      description?: string;
+      mimeType?: string;     // e.g., "text/plain", "image/png"
+    }
+    // OR URI Template:
+    {
+      uriTemplate: string;   // RFC 6570 template (e.g., "db://users/{userId}")
+      name: string;
+      description?: string;
+      mimeType?: string;
+    }
+    ```
+*   **Protocol Methods/Notifications:**
+    *   `resources/list` (Request): Client asks for available resources/templates.
+    *   `resources/read` (Request): Client asks to read content for a specific URI. Server responds with `{ contents: [{ uri: string, mimeType?: string, text?: string, blob?: string }] }`. Can return multiple contents (e.g., directory listing).
+    *   `resources/subscribe` (Request): Client subscribes to content changes for a URI.
+    *   `resources/unsubscribe` (Request): Client unsubscribes.
+    *   `notifications/resources/list_changed` (Notification): Server informs client the resource list changed.
+    *   `notifications/resources/updated` (Notification): Server informs client subscribed resource content changed.
+
+### 2.2. Tools
+
+*   **Purpose:** Expose **model-controlled** executable functions from servers. LLMs can invoke these (typically with user approval) to perform actions (e.g., run commands, call APIs, computations).
+*   **Structure (`tools/list` response):**
+    ```typescript
+    {
+      name: string;          // Unique identifier (function name)
+      description?: string;  // Description for LLM/user (should include examples)
+      inputSchema: {         // JSON Schema describing required input arguments
+        type: "object",
+        properties: { ... }, // e.g., { "query": { "type": "string", "description": "Search query" } }
+        required?: string[]  // e.g., ["query"]
+      }
+    }
+    ```
+*   **Protocol Methods/Notifications:**
+    *   `tools/list` (Request): Client asks for available tools.
+    *   `tools/call` (Request): Client asks server to execute a tool. Params: `{ name: string, arguments: object }`. Server responds with `{ content: [{ type: "text" | "image" | "resource", ... }], isError?: boolean }`.
+    *   `notifications/tools/list_changed` (Notification): Server informs client the tool list changed.
+*   **Error Handling:** Tool execution errors should be reported in the `tools/call` *result* with `isError: true` and details in the `content`, not as a top-level JSON-RPC error. This allows the LLM to potentially handle the failure.
+
+### 2.3. Prompts
+
+*   **Purpose:** Expose **user-controlled** reusable prompt templates or workflows from servers. Clients surface these (e.g., as slash commands) for users to select explicitly.
+*   **Structure (`prompts/list` response):**
+    ```typescript
+    {
+      name: string;              // Unique identifier
+      description?: string;
+      arguments?: [              // Optional list of arguments the prompt accepts
+        {
+          name: string;          // Argument identifier
+          description?: string;
+          required?: boolean;
+        }
+      ]
+    }
+    ```
+*   **Protocol Methods/Notifications:**
+    *   `prompts/list` (Request): Client asks for available prompts.
+    *   `prompts/get` (Request): Client asks server to generate the messages for a specific prompt. Params: `{ name: string, arguments?: object }`. Server responds with `{ description?: string, messages: [{ role: "user" | "assistant", content: { type: "text" | "resource", ... } }] }`.
+    *   `notifications/prompts/list_changed` (Notification): Server informs client the prompt list changed.
+*   **Dynamic Content:** `prompts/get` response can include dynamically fetched data, potentially embedded as `resource` content within messages.
+
+### 2.4. Sampling
+
+*   **Purpose:** Allows servers to request LLM completions *through* the client. Enables agentic behavior while keeping LLM access controlled by the client/user. (Note: Not supported by all clients, e.g., currently not Claude Desktop).
+*   **Flow:** Server sends `sampling/createMessage` -> Client reviews/modifies -> Client calls LLM -> Client reviews/modifies completion -> Client returns result to Server.
+*   **Request Structure (`sampling/createMessage` params):**
+    ```typescript
+    {
+      messages: [ { role: "user" | "assistant", content: { type: "text" | "image", ... } } ],
+      modelPreferences?: {
+        hints?: [{ name?: string }], // e.g., "claude-3-opus"
+        costPriority?: number,      // 0-1
+        speedPriority?: number,     // 0-1
+        intelligencePriority?: number // 0-1
+      },
+      systemPrompt?: string,
+      includeContext?: "none" | "thisServer" | "allServers", // Client ultimately decides
+      temperature?: number,
+      maxTokens?: number,
+      stopSequences?: string[],
+      metadata?: Record<string, unknown> // Provider-specific
+    }
+    ```
+*   **Response Structure (`sampling/createMessage` result):**
+    ```typescript
+    {
+      model: string, // Model actually used
+      stopReason?: "endTurn" | "stopSequence" | "maxTokens" | string,
+      role: "user" | "assistant",
+      content: { type: "text" | "image", ... }
+    }
+    ```
+
+### 2.5. Roots
+
+*   **Purpose:** Allow clients to suggest operational boundaries (URIs, often filesystem paths) to servers. Primarily informational; servers *should* respect them but aren't strictly sandboxed by the protocol itself.
+*   **Client Capability:** Client declares `roots` capability during initialization.
+*   **Structure:** `{ uri: string, name?: string }`
+*   **Client Actions:** Clients supporting roots typically provide a list on connection and may send notifications if the list changes.
+
+## 3. SDK Implementation Guide: Python (`mcp` package)
+
+### 3.1. Setup
+
+```bash
+# Using uv (recommended)
+uv venv
+source .venv/bin/activate # or .venv\Scripts\activate on Windows
+uv add "mcp" # Add [cli] for cli tools if needed: uv add "mcp[cli]"
+uv add httpx # Often needed for API calls within servers
+```
+
+### 3.2. Server Implementation
+
+*   **Initialization:**
+    ```python
+    # Simple Server (manual handlers)
+    from mcp.server import Server
+    app = Server("my-server-name")
+
+    # OR FastMCP (uses type hints/docstrings for tools)
+    from mcp.server.fastmcp import FastMCP
+    mcp = FastMCP("my-server-name")
+    ```
+*   **Defining Tools:**
+    *   **FastMCP:**
+        ```python
+        @mcp.tool()
+        async def my_tool(param1: str, param2: int = 0) -> str:
+            """
+            Description of the tool for the LLM.
+
+            Args:
+                param1: Description of param1.
+                param2: Description of optional param2.
+            """
+            # Tool logic...
+            return f"Result based on {param1} and {param2}"
+        ```
+    *   **Simple Server:**
+        ```python
+        import mcp.types as types
+        @app.list_tools()
+        async def list_tools() -> list[types.Tool]:
+            return [
+                types.Tool(
+                    name="my_tool",
+                    description="Description...",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "param1": {"type": "string", "description": "..."},
+                            "param2": {"type": "number", "description": "..."}
+                        },
+                        "required": ["param1"]
+                    }
+                )
+            ]
+
+        @app.call_tool()
+        async def call_tool(name: str, arguments: dict) -> list[types.Content]:
+            if name == "my_tool":
+                # Tool logic using arguments['param1'], arguments.get('param2')
+                result_text = f"Result..."
+                return [types.TextContent(type="text", text=result_text)]
+            raise ValueError(f"Tool not found: {name}")
+        ```
+*   **Defining Resources:**
+    ```python
+    import mcp.types as types
+    from pydantic import AnyUrl # For URI type validation
+
+    @app.list_resources()
+    async def list_resources() -> list[types.Resource]:
+        return [
+            types.Resource(uri="file:///path/to/resource.txt", name="My File", mimeType="text/plain")
+            # Add URI Templates if needed
+        ]
+
+    # Simple read returning string content (SDK handles wrapping)
+    @app.read_resource()
+    async def read_resource(uri: AnyUrl) -> str:
+        if str(uri) == "file:///path/to/resource.txt":
+            # Read logic...
+            return "File content here"
+        raise ValueError("Resource not found")
+
+    # More complex read returning list of contents
+    # @app.read_resource()
+    # async def read_resource_complex(uri: AnyUrl) -> list[types.ResourceContent]:
+    #    if str(uri) == "some://uri":
+    #        return [types.ResourceContent(uri=uri, text="Content")]
+    #    raise ValueError("Resource not found")
+    ```
+*   **Defining Prompts:**
+    ```python
+    import mcp.types as types
+
+    @app.list_prompts()
+    async def list_prompts() -> list[types.Prompt]:
+        return [
+            types.Prompt(
+                name="my-prompt",
+                description="Description...",
+                arguments=[types.PromptArgument(name="arg1", required=True)]
+            )
+        ]
+
+    @app.get_prompt()
+    async def get_prompt(name: str, arguments: dict | None = None) -> types.GetPromptResult:
+        if name == "my-prompt":
+            arg1_val = arguments.get("arg1", "") if arguments else ""
+            return types.GetPromptResult(
+                messages=[
+                    types.PromptMessage(
+                        role="user",
+                        content=types.TextContent(type="text", text=f"Prompt with {arg1_val}")
+                    )
+                ]
+            )
+        raise ValueError("Prompt not found")
+    ```
+*   **Sending Log Notifications:** (Access session context within handlers)
+    ```python
+    # Inside a request handler (e.g., call_tool, read_resource)
+    app.request_context.session.send_log_message(
+        level="info",
+        data="Log message data"
+    )
+    ```
+*   **Running the Server:**
+    ```python
+    import asyncio
+    from mcp.server.stdio import stdio_server
+
+    async def main():
+        # For Simple Server ('app')
+        async with stdio_server() as streams:
+            await app.run(
+                streams[0], streams[1],
+                app.create_initialization_options() # Pass capabilities here if needed
+            )
+
+    if __name__ == "__main__":
+        # For FastMCP ('mcp')
+        # mcp.run(transport='stdio') # Simpler way for FastMCP
+
+        # For Simple Server ('app')
+        asyncio.run(main())
+    ```
+
+### 3.3. Client Implementation
+
+```python
+import asyncio
+from contextlib import AsyncExitStack
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+# from mcp.client.sse import sse_client # For SSE transport
+
+async def run_client():
+    params = StdioServerParameters(
+        command="python", # or "node", "uv", etc.
+        args=["/path/to/server/script.py"], # or js, or other args
+        # env={"VAR": "value"} # Optional env vars
+    )
+
+    async with AsyncExitStack() as stack:
+        # Use stdio_client(params) or sse_client("http://host/path")
+        read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
+        session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+
+        # Initialize connection
+        init_result = await session.initialize(
+            # capabilities=ClientCapabilities(...) # Define client caps if needed
+        )
+        print(f"Connected to Server: {init_result.serverInfo}")
+
+        # List features
+        tools_resp = await session.list_tools()
+        print(f"Tools: {[t.name for t in tools_resp.tools]}")
+
+        resources_resp = await session.list_resources()
+        print(f"Resources: {[r.name for r in resources_resp.resources]}")
+
+        # Call a tool
+        try:
+            call_result = await session.call_tool("tool_name", {"arg1": "value"})
+            print(f"Tool Result: {call_result.content}")
+        except Exception as e:
+            print(f"Tool call failed: {e}")
+
+        # Read a resource
+        try:
+            read_result = await session.read_resource("resource://uri")
+            print(f"Resource Content: {read_result.contents}")
+        except Exception as e:
+            print(f"Resource read failed: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(run_client())
+```
+
+### 3.4. Transport Examples
+
+*   **Stdio Server:** See `app.run` / `mcp.run` examples above.
+*   **Stdio Client:** See `run_client` example above.
+*   **SSE Server (Example using Starlette):**
+    ```python
+    from mcp.server.sse import SseServerTransport
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    # ... import your 'app' or 'mcp' server instance ...
+
+    sse_transport = SseServerTransport("/messages") # POST endpoint for client->server
+
+    async def handle_sse(scope, receive, send):
+        async with sse_transport.connect_sse(scope, receive, send) as streams:
+            # Replace 'app' with your server instance if needed
+            await app.run(streams[0], streams[1], app.create_initialization_options())
+
+    async def handle_messages(scope, receive, send):
+        await sse_transport.handle_post_message(scope, receive, send)
+
+    starlette_app = Starlette(
+        routes=[
+            Route("/sse", endpoint=handle_sse), # GET endpoint for server->client SSE stream
+            Route("/messages", endpoint=handle_messages, methods=["POST"]),
+        ]
+    )
+    # Run starlette_app with uvicorn, etc.
+    ```
+*   **SSE Client:**
+    ```python
+    from mcp.client.sse import sse_client
+    # ... inside async function ...
+    async with sse_client("http://localhost:8000/sse") as streams: # URL of the SSE endpoint
+        async with ClientSession(streams[0], streams[1]) as session:
+            await session.initialize()
+            # ... use session ...
+    ```
+
+## 4. SDK Implementation Guide: TypeScript (`@modelcontextprotocol/sdk`)
+
+### 4.1. Setup
+
+```bash
+npm install @modelcontextprotocol/sdk zod # zod is commonly used for schemas
+npm install -D typescript @types/node
+# Setup tsconfig.json (target ES2022, module Node16/NodeNext, outDir, etc.)
+# Add "type": "module" to package.json
+```
+
+### 4.2. Server Implementation
+
+```typescript
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+// import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { ListResourcesRequestSchema, ReadResourceRequestSchema, ListToolsRequestSchema, CallToolRequestSchema /* ... other schemas */ } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
+
+// Initialize server
+const server = new McpServer({
+  name: "my-ts-server",
+  version: "1.0.0",
+});
+
+// Define Tools using .tool helper
+const sumInputSchema = z.object({
+  a: z.number(),
+  b: z.number(),
+});
+server.tool(
+  "calculate_sum",
+  "Adds two numbers",
+  sumInputSchema,
+  async (args) => {
+    const result = args.a + args.b;
+    return { content: [{ type: "text", text: String(result) }] };
+  }
+);
+
+// Define Resources using setRequestHandler
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  return {
+    resources: [
+      { uri: "file:///data.txt", name: "Data File", mimeType: "text/plain" }
+    ]
+  };
+});
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  if (request.params.uri === "file:///data.txt") {
+    return { contents: [{ uri: request.params.uri, text: "File content" }] };
+  }
+  throw new Error("Resource not found");
+});
+
+// Define Prompts similarly using setRequestHandler
+// server.setRequestHandler(ListPromptsRequestSchema, async () => { ... });
+// server.setRequestHandler(GetPromptRequestSchema, async (request) => { ... });
+
+// Send Log Notifications
+function someAction() {
+  server.sendLoggingMessage({ level: "info", data: "Action performed" });
+}
+
+// Connect transport and run
+async function main() {
+  const transport = new StdioServerTransport();
+  // const transport = new SSEServerTransport("/messages"); // For SSE
+  await server.connect(transport);
+  console.error("MCP Server running on stdio"); // Log to stderr
+}
+
+main().catch(console.error);
+
+// For SSE, you'd need an HTTP server (like express)
+// import express from 'express';
+// const app = express();
+// const sseTransport = new SSEServerTransport('/messages'); // POST path
+// app.get('/sse', (req, res) => { // GET path for SSE stream
+//   sseTransport.handleSseRequest(req, res);
+//   server.connect(sseTransport); // Connect when client connects
+// });
+// app.post('/messages', express.json(), (req, res) => { // POST path for client->server
+//   sseTransport.handlePostMessage(req, res);
+// });
+// app.listen(3000);
+```
+
+### 4.3. Client Implementation
+
+```typescript
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+// import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+
+async function runClient() {
+  const client = new Client({ name: "my-ts-client", version: "1.0.0" });
+
+  const transport = new StdioClientTransport({
+    command: "node", // or python, etc.
+    args: ["/path/to/server/build/index.js"], // Path to built JS server
+    // env: { VAR: "value" }
+  });
+  // const transport = new SSEClientTransport(new URL("http://localhost:3000/sse"));
+
+  await client.connect(transport);
+
+  // Initialize
+  const initResult = await client.initialize(/* { capabilities: ... } */);
+  console.log("Connected:", initResult.serverInfo);
+
+  // List features
+  const tools = await client.listTools();
+  console.log("Tools:", tools.tools.map(t => t.name));
+
+  // Call tool
+  try {
+    const callResult = await client.callTool({
+      name: "calculate_sum",
+      arguments: { a: 5, b: 3 },
+    });
+    console.log("Call Result:", callResult.content);
+  } catch (e) {
+    console.error("Call failed:", e);
+  }
+
+  // Read resource
+  try {
+    const readResult = await client.readResource({ uri: "file:///data.txt" });
+    console.log("Read Result:", readResult.contents);
+  } catch (e) {
+    console.error("Read failed:", e);
+  }
+
+  await client.close();
+}
+
+runClient().catch(console.error);
+```
+
+### 4.4. Transport Examples
+
+*   **Stdio Server/Client:** See examples above.
+*   **SSE Server/Client:** See commented sections in examples above (requires an HTTP framework like Express for the server).
+
+## 5. SDK Implementation Guide: Java (`io.modelcontextprotocol.sdk`)
+
+### 5.1. Setup
+
+*   **Maven/Gradle:** Add `io.modelcontextprotocol.sdk:mcp` dependency. Use the `mcp-bom` for version management. Add transport dependencies (`mcp-spring-webflux`, `mcp-spring-webmvc`) if needed.
+
+    ```xml
+    <!-- Example Maven POM with BOM -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.modelcontextprotocol.sdk</groupId>
+                <artifactId>mcp-bom</artifactId>
+                <version>0.7.0</version> <!-- Use latest -->
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp</artifactId>
+        </dependency>
+        <!-- Add transport deps if needed, e.g.: -->
+        <!--
+        <dependency>
+            <groupId>io.modelcontextprotocol.sdk</groupId>
+            <artifactId>mcp-spring-webflux</artifactId>
+        </dependency>
+         -->
+    </dependencies>
+    ```
+
+### 5.2. Server Implementation
+
+```java
+import io.modelcontextprotocol.mcp.*; // Core types
+import io.modelcontextprotocol.mcp.protocol.*; // Protocol messages/schemas
+import io.modelcontextprotocol.mcp.server.*; // Server classes
+import io.modelcontextprotocol.mcp.transport.stdio.StdioServerTransport; // Stdio Transport
+// import specific SSE transports if needed
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import reactor.core.publisher.Mono; // For Async API
+
+import java.util.List;
+import java.util.Map;
+
+public class JavaServerExample {
+
+    public static void main(String[] args) throws Exception {
+        ObjectMapper objectMapper = new ObjectMapper(); // Reuse ObjectMapper
+        StdioServerTransport transport = new StdioServerTransport(objectMapper);
+
+        // --- Choose Sync or Async ---
+
+        // --- Sync Server ---
+        McpSyncServer syncServer = McpServer.sync(transport)
+                .serverInfo("my-java-server", "1.0.0")
+                .capabilities(ServerCapabilities.builder().tools(true).resources(true).prompts(true).logging().build())
+                .build();
+
+        // Register Sync Tool
+        String toolSchemaJson = """
+                { "type": "object", "properties": { "a": {"type": "number"}, "b": {"type": "number"} }, "required": ["a", "b"] }
+                """;
+        var syncTool = new McpServerFeatures.SyncToolRegistration(
+                new Tool("calculator", "Adds numbers", toolSchemaJson),
+                (args) -> {
+                    double a = ((Number) args.get("a")).doubleValue();
+                    double b = ((Number) args.get("b")).doubleValue();
+                    String resultText = String.valueOf(a + b);
+                    return new CallToolResult(List.of(new Content("text", resultText)), false);
+                });
+        syncServer.addTool(syncTool);
+
+        // Register Sync Resource
+        var syncResource = new McpServerFeatures.SyncResourceRegistration(
+                new Resource("data://item1", "Item 1", "Desc", "text/plain", null),
+                (req) -> new ReadResourceResult(List.of(new ResourceContent(req.getUri(), "text/plain", "Content of item 1", null)))
+        );
+        syncServer.addResource(syncResource);
+
+        // Register Sync Prompt
+        var syncPrompt = new McpServerFeatures.SyncPromptRegistration(
+            new Prompt("echo", "Echoes input", List.of(new PromptArgument("text", "Text to echo", true))),
+            (req) -> new GetPromptResult(null, List.of(
+                new PromptMessage("user", new Content("text", (String)req.getArguments().get("text")))
+            ))
+        );
+        syncServer.addPrompt(syncPrompt);
+
+        // Send Log
+        syncServer.loggingNotification(LoggingMessageNotification.builder().level(LoggingLevel.INFO).data("Sync server started").build());
+
+        // Keep server running (in real app, manage lifecycle differently)
+        System.out.println("Sync Server running on stdio. Press Enter to exit.");
+        System.in.read();
+        syncServer.close();
+
+        // --- OR Async Server ---
+        McpAsyncServer asyncServer = McpServer.async(transport)
+                .serverInfo("my-java-async-server", "1.0.0")
+                .capabilities(ServerCapabilities.builder().tools(true).resources(true).prompts(true).logging().build())
+                .build();
+
+        // Register Async Tool
+        var asyncTool = new McpServerFeatures.AsyncToolRegistration(
+                new Tool("calculator_async", "Adds numbers async", toolSchemaJson),
+                (args) -> Mono.fromCallable(() -> { // Example async operation
+                    double a = ((Number) args.get("a")).doubleValue();
+                    double b = ((Number) args.get("b")).doubleValue();
+                    return new CallToolResult(List.of(new Content("text", String.valueOf(a + b))), false);
+                }));
+        asyncServer.addTool(asyncTool).subscribe(); // Subscribe to register
+
+        // Register Async Resource
+        var asyncResource = new McpServerFeatures.AsyncResourceRegistration(
+                new Resource("data://itemAsync", "Async Item", "Desc", "text/plain", null),
+                (req) -> Mono.just(new ReadResourceResult(List.of(new ResourceContent(req.getUri(), "text/plain", "Async content", null))))
+        );
+        asyncServer.addResource(asyncResource).subscribe();
+
+        // Register Async Prompt
+         var asyncPrompt = new McpServerFeatures.AsyncPromptRegistration(
+            new Prompt("echo_async", "Echoes input async", List.of(new PromptArgument("text", "Text to echo", true))),
+            (req) -> Mono.just(new GetPromptResult(null, List.of(
+                new PromptMessage("user", new Content("text", (String)req.getArguments().get("text")))
+            )))
+        );
+        asyncServer.addPrompt(asyncPrompt).subscribe();
+
+        // Send Log
+        asyncServer.loggingNotification(LoggingMessageNotification.builder().level(LoggingLevel.INFO).data("Async server started").build());
+
+        System.out.println("Async Server running on stdio. Press Enter to exit.");
+        System.in.read();
+        asyncServer.close().block(); // Block for cleanup in this example
+    }
+}
+```
+
+*   **Spring Boot Starter:** Use `spring-ai-mcp-server-spring-boot-starter`. Configure via `application.properties`/`yml`. Use `@Tool` annotation on service methods. Implement `ToolCallbackProvider` bean. See Weather Server example pattern in original quickstart.
+
+### 5.3. Client Implementation
+
+```java
+import io.modelcontextprotocol.mcp.*;
+import io.modelcontextprotocol.mcp.client.*;
+import io.modelcontextprotocol.mcp.protocol.*;
+import io.modelcontextprotocol.mcp.transport.stdio.StdioClientTransport;
+import io.modelcontextprotocol.mcp.transport.stdio.StdioServerParameters;
+// import io.modelcontextprotocol.mcp.transport.http.HttpClientSseClientTransport; // for SSE
+// import io.modelcontextprotocol.mcp.transport.webflux.WebFluxSseClientTransport; // for WebFlux SSE
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import reactor.core.publisher.Mono; // For Async API
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+
+public class JavaClientExample {
+
+    public static void main(String[] args) {
+        ObjectMapper objectMapper = new ObjectMapper();
+
+        // --- Stdio Transport Setup ---
+        StdioServerParameters serverParams = StdioServerParameters.builder("java")
+                .args("-jar", "/path/to/your/server.jar") // Adjust command/args
+                // .env(Map.of("VAR", "value"))
+                .build();
+        StdioClientTransport stdioTransport = new StdioClientTransport(serverParams, objectMapper);
+
+        // --- SSE Transport Setup (Example) ---
+        // HttpClientSseClientTransport sseTransport = new HttpClientSseClientTransport("http://localhost:8080/sse", objectMapper);
+        // WebFluxSseClientTransport wfTransport = new WebFluxSseClientTransport(WebClient.builder().baseUrl("http://localhost:8080")); // needs WebFlux dep
+
+        // --- Choose Sync or Async Client ---
+
+        // --- Sync Client ---
+        McpSyncClient syncClient = McpClient.sync(stdioTransport) // Use chosen transport
+                .requestTimeout(Duration.ofSeconds(15))
+                // .capabilities(ClientCapabilities.builder().roots(true).sampling().build())
+                // .sampling(syncSamplingHandler) // Add handler if sampling enabled
+                .build();
+
+        try {
+            InitializeResult initResult = syncClient.initialize();
+            System.out.println("Sync Client Connected: " + initResult.getServerInfo());
+
+            ListToolsResult tools = syncClient.listTools();
+            System.out.println("Sync Tools: " + tools.getTools());
+
+            CallToolResult toolResult = syncClient.callTool(
+                    new CallToolRequest("calculator", Map.of("a", 10, "b", 5)));
+            System.out.println("Sync Tool Result: " + toolResult.getContent());
+
+            ListResourcesResult resources = syncClient.listResources();
+            System.out.println("Sync Resources: " + resources.getResources());
+
+            ReadResourceResult resourceContent = syncClient.readResource(new ReadResourceRequest("data://item1"));
+            System.out.println("Sync Resource Content: " + resourceContent.getContents());
+
+        } finally {
+            syncClient.closeGracefully();
+            System.out.println("Sync Client Closed");
+        }
+
+
+        // --- OR Async Client ---
+        McpAsyncClient asyncClient = McpClient.async(stdioTransport) // Use chosen transport
+                .requestTimeout(Duration.ofSeconds(15))
+                // .capabilities(...)
+                // .sampling(asyncSamplingHandler)
+                // .toolsChangeConsumer(tools -> Mono.fromRunnable(() -> System.out.println("Async Tools changed: " + tools)))
+                // .resourcesChangeConsumer(...)
+                // .promptsChangeConsumer(...)
+                .build();
+
+        asyncClient.initialize()
+            .doOnSuccess(init -> System.out.println("Async Client Connected: " + init.getServerInfo()))
+            .then(asyncClient.listTools())
+            .doOnSuccess(tools -> System.out.println("Async Tools: " + tools.getTools()))
+            .then(asyncClient.callTool(new CallToolRequest("calculator_async", Map.of("a", 20, "b", 7))))
+            .doOnSuccess(result -> System.out.println("Async Tool Result: " + result.getContent()))
+            .then(asyncClient.listResources())
+            .doOnSuccess(res -> System.out.println("Async Resources: " + res.getResources()))
+            .then(asyncClient.readResource(new ReadResourceRequest("data://itemAsync")))
+            .doOnSuccess(content -> System.out.println("Async Resource Content: " + content.getContents()))
+            .doFinally(signalType -> {
+                System.out.println("Closing Async Client...");
+                asyncClient.closeGracefully().subscribe(
+                    v -> {}, // onComplete
+                    err -> System.err.println("Error closing async client: " + err),
+                    () -> System.out.println("Async Client Closed") // onComplete action
+                );
+            })
+            .block(); // Block for main thread in this example
+
+    }
+    // Define syncSamplingHandler / asyncSamplingHandler if needed
+    // static Function<CreateMessageRequest, CreateMessageResult> syncSamplingHandler = req -> { ... return new CreateMessageResult(...); };
+    // static Function<CreateMessageRequest, Mono<CreateMessageResult>> asyncSamplingHandler = req -> Mono.fromCallable(() -> new CreateMessageResult(...));
+}
+```
+
+*   **Spring Boot Starter:** Use `spring-ai-mcp-client-spring-boot-starter` or `spring-ai-mcp-client-webflux-spring-boot-starter`. Configure via `application.properties`/`yml`, pointing `servers-configuration` to a JSON config file (like `claude_desktop_config.json`). Inject `McpClient` or `McpAsyncClient`. Use `McpToolAdapter` to integrate tools with `ChatClient`. See Brave Search example pattern in original client quickstart.
+
+### 5.4. Transport Examples
+
+*   **Stdio Server/Client:** See examples above.
+*   **SSE Server (WebFlux):** Requires `mcp-spring-webflux`. Define `WebFluxSseServerTransport` bean and `RouterFunction` bean. See Java SDK `mcp-server` documentation.
+*   **SSE Server (WebMvc):** Requires `mcp-spring-webmvc`. Define `WebMvcSseServerTransport` bean and `RouterFunction` bean. See Java SDK `mcp-server` documentation.
+*   **SSE Server (Servlet):** Core `mcp` module. Define `HttpServletSseServerTransport` bean and `ServletRegistrationBean`. See Java SDK `mcp-server` documentation.
+*   **SSE Client (HttpClient):** Core `mcp` module. Instantiate `HttpClientSseClientTransport`. See Client example above.
+*   **SSE Client (WebFlux):** Requires `mcp-spring-webflux`. Instantiate `WebFluxSseClientTransport` (optionally with configured `WebClient.Builder`). See Client example above.
+
+## 6. Configuration & Setup
+
+*   **Server Launch Args/Env:** Servers often take configuration via command-line arguments (e.g., directory paths for filesystem server) or environment variables (e.g., API keys). Check specific server documentation.
+*   **Client Configuration (Claude Desktop Example):**
+    *   **File Location:**
+        *   macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+        *   Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+    *   **Structure:**
+        ```json
+        {
+          "mcpServers": {
+            "server-key-name": { // Logical name for the server
+              "command": "/path/to/executable", // e.g., "node", "python", "uv", "java", "npx"
+              "args": [
+                // Arguments passed to the command
+                // e.g., "/path/to/script.js", "--port", "8080"
+                // Use ABSOLUTE paths for scripts/data unless server handles relative paths correctly
+              ],
+              "env": { // Optional environment variables for the server process
+                "API_KEY": "your_secret_key",
+                "LOG_LEVEL": "debug"
+              }
+            }
+            // Add more servers here...
+          }
+        }
+        ```
+    *   **Paths:** Use **absolute paths** for `command` (if not in system PATH) and any file paths in `args` to avoid issues related to the host app's working directory.
+    *   **Finding Executable Paths:** Use `which <command>` (macOS/Linux) or `where <command>` (Windows).
+
+## 7. Debugging & Tools
+
+*   **Common Issues:**
+    *   **Working Directory:** Server's working directory might be unexpected (e.g., `/` for Claude Desktop). Use absolute paths in config/code.
+    *   **Environment Variables:** Only a base set (e.g., `PATH`, `HOME`, `USER`) might be inherited. Explicitly pass required variables via `env` in config.
+    *   **Path Issues:** Incorrect `command` or script path in `args`. Missing dependencies. Permissions. Use absolute paths.
+    *   **Config Errors:** Invalid JSON in `claude_desktop_config.json`.
+*   **Logging:**
+    *   **Server-Side:**
+        *   **Stdio Transport:** Log debug/error messages to `stderr`. `stdout` is reserved for MCP protocol messages.
+        *   **All Transports:** Use the SDK's logging notification feature (`send_log_message`, `sendLoggingMessage`, `loggingNotification`) to send logs to the client.
+    *   **Client-Side (Host Application):** Check the host application's logs.
+        *   **Claude Desktop Logs:**
+            *   macOS: `~/Library/Logs/Claude/`
+            *   Windows: `%APPDATA%\Claude\logs\`
+            *   `mcp.log`: General connection info/errors.
+            *   `mcp-server-SERVERKEYNAME.log`: Captures `stderr` output from the specific server process launched via config.
+        *   **Real-time Tail (macOS/Linux):** `tail -n 50 -F ~/Library/Logs/Claude/mcp*.log`
+*   **Debugging Tools:**
+    *   **MCP Inspector:** Interactive CLI tool for testing servers directly.
+        *   Run: `npx @modelcontextprotocol/inspector <server_command> [server_args...]`
+        *   Example (TS Server): `npx @modelcontextprotocol/inspector node ./build/index.js`
+        *   Example (Py Server): `npx @modelcontextprotocol/inspector python ./server.py`
+        *   Example (Py Pkg): `npx @modelcontextprotocol/inspector uvx mcp-server-git --repository ~/myrepo`
+        *   Allows calling tools, reading resources, checking prompts directly.
+    *   **Claude Desktop Developer Tools:**
+        *   Enable: Create `~/Library/Application Support/Claude/developer_settings.json` (macOS) or `%APPDATA%\Claude\developer_settings.json` (Windows) with `{"allowDevTools": true}`.
+        *   Open: `Cmd+Opt+Shift+I` (macOS) or `Ctrl+Shift+I` (Windows).
+        *   Use `Console` for client-side JS errors, `Network` tab to inspect MCP message traffic (less useful for stdio).
+*   **Testing Workflow:**
+    1.  Develop server component.
+    2.  Test with MCP Inspector for direct interaction.
+    3.  Configure server in host application (e.g., `claude_desktop_config.json`).
+    4.  Restart host application.
+    5.  Test integration within the host, checking host logs and server `stderr` logs.
