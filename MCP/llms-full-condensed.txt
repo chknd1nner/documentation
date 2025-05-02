@@ -842,8 +842,11 @@ public class JavaClientExample {
           }
         }
         ```
-    *   **Paths:** Use **absolute paths** for `command` (if not in system PATH) and any file paths in `args` to avoid issues related to the host app's working directory.
-    *   **Finding Executable Paths:** Use `which <command>` (macOS/Linux) or `where <command>` (Windows).
+*   **Critical Pitfalls:**
+    *   **Use Absolute Paths:** Always use **absolute paths** for `command` (if not globally in PATH) and any file/directory paths in `args`. Relative paths are unreliable due to the host application's potentially unexpected working directory (See Debugging section).
+    *   **Verify JSON Syntax:** Ensure `claude_desktop_config.json` is valid JSON. Use a JSON validator if unsure. Even a misplaced comma can prevent servers from loading.
+    *   **Environment Variables (`env`):** The server process inherits *only* the environment variables explicitly set in the `env` block *plus* a minimal base environment from the host. Do **not** assume it inherits your full shell environment. Explicitly pass necessary keys (like `API_KEY`, `PATH` extensions if needed).
+    *   **Finding Executable Paths:** Use `which <command>` (macOS/Linux) or `where <command>` (Windows) to find absolute paths if needed.
 
 ## 7. Debugging & Tools
 
@@ -851,7 +854,9 @@ public class JavaClientExample {
     *   **Working Directory:** Server's working directory might be unexpected (e.g., `/` for Claude Desktop). Use absolute paths in config/code.
     *   **Environment Variables:** Only a base set (e.g., `PATH`, `HOME`, `USER`) might be inherited. Explicitly pass required variables via `env` in config.
     *   **Path Issues:** Incorrect `command` or script path in `args`. Missing dependencies. Permissions. Use absolute paths.
-    *   **Config Errors:** Invalid JSON in `claude_desktop_config.json`.
+    *   **Configuration File Errors:** Invalid JSON syntax in `claude_desktop_config.json` (check commas, brackets, quotes). The server definition might simply not load, often silently. Check `mcp.log` in host logs.
+    *   **Permissions:** The server process runs as the same user as the host application, but might lack permissions to read/write specific files/directories depending on system settings (especially on macOS).
+    *   **Dependencies:** Ensure all dependencies for your server (e.g., Node modules, Python packages) are correctly installed and accessible to the specified `command` executable.
 *   **Logging:**
     *   **Server-Side:**
         *   **Stdio Transport:** Log debug/error messages to `stderr`. `stdout` is reserved for MCP protocol messages.
@@ -876,7 +881,7 @@ public class JavaClientExample {
         *   Use `Console` for client-side JS errors, `Network` tab to inspect MCP message traffic (less useful for stdio).
 *   **Testing Workflow:**
     1.  Develop server component.
-    2.  Test with MCP Inspector for direct interaction.
-    3.  Configure server in host application (e.g., `claude_desktop_config.json`).
+    2.  Test with **MCP Inspector** for direct interaction and verification. Check server `stderr`.
+    3.  Configure server in host application (`claude_desktop_config.json`), using **absolute paths** and necessary **`env` vars**. Validate JSON.
     4.  Restart host application.
-    5.  Test integration within the host, checking host logs and server `stderr` logs.
+    5.  Test integration within the host. Check host logs (`mcp.log` and especially `mcp-server-YOURKEY.log` for `stderr`). Use server's MCP logging for runtime info.
